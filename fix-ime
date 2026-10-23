@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+#
+# ime — 输入法急救（macOS）
+#
+# 症状：打字出来是字母（nihao 而不是「你好」），没有候选框。
+# 根因：系统当前输入源掉回英文布局了。Enabled ≠ Selected:
+#         AppleEnabledInputSources  → 能否出现在切换循环里
+#         AppleSelectedInputSources → 按键是否真的进输入法
+#       修复只有一件事：TISSelectInputSource()（等价于点菜单栏输入法图标）。
+#
+# 重启输入法进程没有用。2026-10-22 实测：WeType 进程重启过，候选框依然不出现。
+#
+# 用法见 `ime -h`。
+#
+# 依赖：macOS 自带 bash + swiftc。无第三方库。
+
+set -uo pipefail
+
+HELPER="$HOME/bin/.imeselect"
+
+SCIM="com.apple.inputmethod.SCIM.ITABC"                    # 系统拼音
+WETYPE="com.tencent.inputmethod.wetype.pinyin"             # 微信输入法
+ABC="com.apple.keylayout.ABC"                              # 英文
+
+# ---------------------------------------------------------------------------
+# Swift 源码（内嵌，保证本脚本可单文件拷贝运行；`ime -S` 可打印）
+# ---------------------------------------------------------------------------
+read -r -d '' SWIFT_SRC <<'SWIFT' || true
+import Carbon
+import Foundation
+
+func prop(_ s: TISInputSource, _ k: CFString) -> String? {
+    guard let p = TISGetInputSourceProperty(s, k) else { return nil }
+    return (Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue() as? String)
+}
+
+func flag(_ s: TISInputSource, _ k: CFString) -> Bool {
+    guard let p = TISGetInputSourceProperty(s, k) else { return false }
+    return (Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue() as? NSNumber)?.boolValue ?? false
+}
+
+func allSources() -> [TISInputSource] {
+    TISCreateInputSourceList(nil, false)?.takeRetainedValue() as? [TISInputSource] ?? []
+}
+
+func currentID() -> String {
+    guard let c = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+          let id = prop(c, kTISPropertyInputSourceID) else { return "?" }
+    return id
+}
+
+let args = CommandLine.arguments
+let mode = args.count > 1 ? args[1] : ""
+
+switch mode {
+case "--current":
+    print(currentID())
+
+case "--list":
+    var seen = Set<String>()
+    for s in allSources() {
+        guard let id = prop(s, kTISPropertyInputSourceID) else { continue }
+        guard flag(s, kTISPropertyInputSourceIsEnabled) else { continue }
+        guard flag(s, kTISPropertyInputSourceIsSelectCapable) else { continue }
+        guard !seen.contains(id) else { continue }
+        seen.insert(id)
+        print(id)
+    }
+
+default:
+    let want = mode.isEmpty ? "com.apple.inputmethod.SCIM.ITABC" : mode
+    for s in allSources() where prop(s, kTISPropertyInputSourceID) == want {
+        if TISSelectInputSource(s) == noErr {
+            usleep(400_000)
+            let got = currentID()
+            print(got)
+            exit(got == want ? 0 : 3)
+        }
+    }
+    FileHandle.standardError.write("未找到或无法选中 \(want)\n".data(using: .utf8)!)
+    exit(1)
+}
+SWIFT
+
+# ---------------------------------------------------------------------------
+# helper 管理
+# ---------------------------------------------------------------------------
+
+# swift 每次执行约 10 秒，所以编译一次缓存成二进制。
+# 本脚本比 helper 新时强制重编，避免用到过期二进制。
+build_helper() {
+    if [ -x "$HELPER" ] && [ "$HELPER" -nt "$0" ]; then return 0; fi
+
+    command -v swiftc >/dev/null 2>&1 || {
+        echo "❌ 找不到 swiftc。请安装 Xcode Command Line Tools：" >&2
+        echo "   xcode-select --install" >&2
+        return 1
+    }
+
+    mkdir -p "$(dirname "$HELPER")"
+    # swiftc 靠扩展名判断语言，所以临时文件必须带 .swift
+    local src; src="$(mktemp -t imeselect).swift"
+    printf '%s\n' "$SWIFT_SRC" > "$src"
+    if ! swiftc -O -o "$HELPER" "$src" 2>/dev/null; then
+        echo "❌ 编译 helper 失败" >&2
+        rm -f "$src"
+        return 1
+    fi
+    rm -f "$src"
+    return 0
+}
+
+cur() { "$HELPER" --current 2>/dev/null || echo "?"; }
+
+label() {
+    case "$1" in
+        "$SCIM")   printf '系统拼音' ;;
+        "$WETYPE") printf '微信输入法' ;;
+        "$ABC")    printf '英文 ABC' ;;
+        "com.apple.CharacterPaletteIM") printf '表情符号' ;;
+        *)         printf '%s' "$1" ;;
+    esac
+}
+
+usage() {
+    cat <<'EOF'
+ime — 输入法急救（macOS）
+
+用法:
+  ime [-n]            切到系统拼音（默认，最稳）
+  ime wx [-n]         切到微信输入法
+  ime abc [-n]        切到英文 ABC
+  ime -s, --status    只看当前状态
+  ime -l, --list      列出已启用且可切换的输入源
+  ime -S, --source    打印内嵌的 Swift 源码
+  ime -h, --help      显示本帮助
+
+选项:
+  -n, --dry-run       只报告将要做什么，不切换
+  --target-app <名>   切换后把该 App 激活（缓解「按 App 分别记输入法」）
+
+说明:
+  输入法状态是「按 App 分别记录」的。本命令改的是系统当前输入源，
+  如果目标 App 仍用它自己记住的那个，切过去后在该窗口按一次 Caps Lock
+  或 Ctrl+Space 即可。
+
+退出码:
+  0 成功  1 失败  3 切换后状态不符  4 被前台 App 的记忆改回
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+main() {
+    # 默认切到系统拼音。注意默认值必须是真正的 bundle id，
+    # 写成 "pinyin" 这类别名会落入 label/current 比对失败的坑。
+    local dry=0 target_app="" action="$SCIM"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)    usage; exit 0 ;;
+            -s|--status)  action="status" ;;
+            -l|--list)    action="list" ;;
+            -S|--source)  action="source" ;;
+            -n|--dry-run) dry=1 ;;
+            --target-app) shift; target_app="${1:-}" ;;
+            wx|wechat|wetype) action="$WETYPE" ;;
+            abc|en|english)   action="$ABC" ;;
+            pinyin|zh)        action="$SCIM" ;;
+            *) printf '未知参数: %s\n\n' "$1" >&2; usage; exit 64 ;;
+        esac
+        shift
+    done
+
+    case "$action" in
+        source) printf '%s\n' "$SWIFT_SRC"; exit 0 ;;
+    esac
+
+    command -v swiftc >/dev/null 2>&1 || [ -x "$HELPER" ] || {
+        echo "❌ 缺少 swiftc 且没有缓存的 helper。先装 Xcode Command Line Tools：" >&2
+        echo "   xcode-select --install" >&2
+        exit 1
+    }
+
+    build_helper || exit 1
+
+    case "$action" in
+        status)
+            local c; c=$(cur)
+            printf '当前输入源: %s  (%s)\n' "$(label "$c")" "$c"
+            if [ "$c" = "$ABC" ]; then
+                printf '  ⚠️  英文布局 — 这就是打不出中文的原因。跑 `ime` 或 `ime wx` 修复。\n'
+                exit 0
+            fi
+            printf '  ✅ 非英文布局，按键应能进输入法。\n'
+            exit 0
+            ;;
+        list)
+            "$HELPER" --list | while read -r id; do
+                printf '  %-45s %s\n' "$id" "$(label "$id")"
+            done
+            exit 0
+            ;;
+    esac
+
+    local target="$action"
+    local before; before=$(cur)
+
+    if [ "$before" = "$target" ]; then
+        printf '已是 %s（%s），无需切换\n' "$(label "$target")" "$target"
+        exit 0
+    fi
+
+    printf '%s → %s\n' "$(label "$before")" "$(label "$target")"
+
+    if [ "$dry" = 1 ]; then
+        printf '  (dry-run，未实际切换)\n'
+        exit 0
+    fi
+
+    # 微信输入法进程不在时顺手拉起。
+    # 用 bundle id：open -a <路径> 对无 Dock 图标的后台输入法会报 -600 procNotFound。
+    if [ "$target" = "$WETYPE" ] && ! pgrep -f "Input Methods/WeType.app/Contents/MacOS/WeType" >/dev/null; then
+        printf '  拉起微信输入法进程…\n'
+        open -b com.tencent.inputmethod.wetype 2>/dev/null
+        local i
+        for i in $(seq 1 15); do
+            pgrep -f "Input Methods/WeType.app/Contents/MacOS/WeType" >/dev/null && break
+            sleep 0.3
+        done
+    fi
+
+    # 切换。不信任返回码，只用真实状态判定。
+    "$HELPER" "$target" >/dev/null 2>&1
+
+    local attempt final
+    for attempt in 1 2 3; do
+        final=$(cur)
+        [ "$final" = "$target" ] && break
+        sleep 0.5
+        "$HELPER" "$target" >/dev/null 2>&1
+    done
+    final=$(cur)
+
+    if [ -n "$target_app" ]; then
+        osascript -e "tell application \"$target_app\" to activate" >/dev/null 2>&1 \
+            || printf '  ⚠️  无法激活 %s\n' "$target_app"
+        sleep 0.4
+        final=$(cur)
+    fi
+
+    if [ "$final" = "$target" ]; then
+        printf '  ✅ 现在是 %s\n' "$(label "$final")"
+        printf '\n提示: 输入法按 App 分别记录。若目标窗口仍不出候选框，\n'
+        printf '      在那里按一次 Caps Lock 或 Ctrl+Space。\n'
+        exit 0
+    fi
+
+    printf '  ⚠️  切换被前台 App 的记忆改回成 %s（目标 %s）\n' "$(label "$final")" "$(label "$target")"
+    printf '     前台 App 会强制恢复它自己记住的输入源。试：\n'
+    printf '       1) 先把焦点定到要打字的窗口，再按 Caps Lock\n'
+    printf '       2) 或点菜单栏输入法图标\n'
+    printf '       3) 或用 --target-app <App名> 让它先到前台再切\n'
+    exit 4
+}
+
+main "$@"
